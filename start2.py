@@ -1,180 +1,238 @@
-from tkinter import *
-from tkinter.ttk import *
+import os
+import sys
+from threading import Thread
+from ctypes import c_wchar_p
+from multiprocessing import Condition, Value, Pool
+from PyQt5 import *
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+import ScanWorker
 
-
-
-from wx import *
-from wx import dataview
-
-class FolderViewItem(dataview.DataViewItem):
-	# Types: folder, file
-	def __init__(self, itemType, label, parent, id=ID_ANY):
-		super().__init__(id)
-		self.itemType = itemType
-		self.label = label
-		self.status = ""
-		self.parent = parent
-
-
-class FolderViewModel(dataview.DataViewModel):
+class ProgressTracker(Thread):
 	def __init__(self):
 		super().__init__()
-		self.data = []
-		self.root = FolderViewItem("root", "", None, ID_NONE)
-		self.data.append(self.root)
+		self.lock = Condition()
+		self.done = Value("H", 0)
+		self.file = Value(c_wchar_p, "")
+		self.progress = Value("d", 0.0)
+		self.callbacks = []
 
-	def IsContainer(self, item):
-		if item is FolderViewItem:
-			return len(item.children) > 0
-		return False
+	def update(self, file, progress):
+		with self.lock:
+			self.file = file
+			self.progress = progress
+			self.lock.notifyAll()
 
-	def GetParent(self, item):
-		print("looking for", item.GetID())
-		results = list(filter(lambda d: d.GetID().__eq__(item.GetID()), self.data))
-		if not results[0].parent: return self.root
-		else: return results[0].parent
+	def complete(self):
+		with self.done.get_lock():
+			self.done.value = 1
+		with self.lock:
+			self.lock.notifyAll()
 
-	def GetChildren(self, item, childrenRet):
-		print(item.Id)
-		childrenRet = item.children
-		return len(childrenRet)
+	def registerUpdateCallback(self, callback):
+		self.callbacks.append(callback)
 
-	def GetColumnCount(self):
-		return 2
+	def run(self):
+		while True:
+			with self.done.get_lock():
+				if self.done.value:
+					break
+				self.lock.wait()
+				with self.file.get_lock() and self.progress.get_lock():
+					for callback in self.callbacks:
+						callback(file.value, progress.value)
 
-	def GetColumnType(self, col):
-		return "text"
 
-	def GetValue(self, item, col):
-		if col == 0: return item.label
-		else: return item.status
 
-	def addItem(self, item, parent):
-		self.data.append(item)
-		if not parent:
-			self.ItemAdded(self.root, item)
-		else:
-			self.ItemAdded(parent, item)
+class TreeItem(QTreeWidgetItem):
+	def __init__(self, path, status):
+		super().__init__([path, status])
+		self.path = path
+		self.status = status
 
-class OptionDialog(Dialog):
-	def __init__(self, parent, config):
-		super().__init__(parent, title="Options")
+
+class OptionsDialog(QDialog):
+	def __init__(self, config, parent=None):
+		super().__init__(parent)
+
+		self.setMinimumSize(QSize(500, 250))
+
+		mainBox = QVBoxLayout()
+		
+		entryBox = QHBoxLayout()
+		label = QLabel("File Exts")
+		self.fileTypes = QLineEdit(",".join(config["filetypes"]))
+		entryBox.addWidget(label)
+		entryBox.addWidget(self.fileTypes)
+		mainBox.addLayout(entryBox)
+
+		buttonBox = QHBoxLayout()
+		ok = QPushButton("Ok")
+		ok.clicked.connect(self.onOK)
+		buttonBox.addWidget(ok)
+
+		cancel = QPushButton("Cancel")
+		cancel.clicked.connect(self.reject)
+		buttonBox.addWidget(cancel)
+
+		mainBox.addLayout(buttonBox)
+		self.setLayout(mainBox)
+
+	def onOK(self):
+		filetypes = self.fileTypes.text().split(",")
+		config = {
+			"filetypes" : filetypes
+		}
 		self.config = config
+		self.accept()
 
-		fileTypeText = StaticText(self, label="File Exts")
-		self.fileType = TextCtrl(self)
-		self.fileType.SetValue(",".join(config["filetypes"]))
-
-		ok = Button(self, label="Ok", id=ID_OK)
-		cancel = Button(self, label="Cancel", id=ID_CANCEL)
-
-		mainSizer = BoxSizer(VERTICAL)
-
-		fileTypeSizer = BoxSizer(HORIZONTAL)
-		fileTypeSizer.Add(fileTypeText, flag=EXPAND | LEFT | RIGHT | ALIGN_CENTER_VERTICAL, border=3)
-		fileTypeSizer.Add(self.fileType, proportion=5, flag=EXPAND | RIGHT, border=3)
-
-		exitSizer = BoxSizer(HORIZONTAL)
-		exitSizer.Add(ok, flag=EXPAND | ALIGN_RIGHT)
-		exitSizer.Add(cancel, flag=EXPAND | ALIGN_RIGHT)
-
-		mainSizer.Add(fileTypeSizer, flag=EXPAND | ALL)
-		mainSizer.Add(exitSizer, flag=EXPAND | ALIGN_RIGHT)
-
-		self.SetSizer(mainSizer)
-
-		ok.Bind(EVT_BUTTON, self.onBtn)
-		cancel.Bind(EVT_BUTTON, self.onBtn)
-
-		pass
-
-	def onBtn(self, event):
-		if self.IsModal():
-			if event.EventObject.Id == ID_OK:
-				self.config = {
-					"filetypes" : self.fileType.GetValue().split(",")
-				}
-			self.EndModal(event.EventObject.Id)
-		else:
-			self.Close()
-
-
-class MainWindow(Frame):
-	def createScreen(self):
-		self.folderView = self.createFolderView()
-
-		addFolder = Button(self, label="Add Folder")
-		addFolder.Bind(EVT_BUTTON, self.addFolder)
-
-		rescan = Button(self, label="Rescan Folders")
-		rescan.Bind(EVT_BUTTON, self.rescanFolders)
-
-		options = Button(self, label="Options")
-		options.Bind(EVT_BUTTON, self.showOptions)
-
-		findDupes = Button(self, label="Find Dupes")
-		findDupes.Bind(EVT_BUTTON, self.findDupes)
-		
-		mainSizer = BoxSizer(VERTICAL)
-		buttonSizer = BoxSizer(HORIZONTAL)
-
-		mainSizer.Add(self.folderView, proportion=5, flag=EXPAND | ALL, border=3)
-		mainSizer.Add(buttonSizer, proportion=1, flag=EXPAND | ALL, border = 3)
-
-		leftButtonSizer = BoxSizer(HORIZONTAL)
-		leftButtonSizer.Add(addFolder)
-		leftButtonSizer.Add(rescan)
-		leftButtonSizer.Add(options)
-		
-		buttonSizer.Add(leftButtonSizer, proportion=1, flag=ALIGN_LEFT)
-		buttonSizer.Add(findDupes, flag=ALIGN_RIGHT)
-
-		self.SetSizer(mainSizer)
-
-	def createFolderView(self):
-		folderView = dataview.DataViewCtrl(self)
-		folderView.AppendTextColumn("Files", 0)
-		folderView.AppendTextColumn("Status", 1)
-
-		folderViewModel = FolderViewModel()
-		folderView.AssociateModel(folderViewModel)
-		folderViewModel.DecRef()
-
-		return folderView
-
-	def addFolder(self, event):
-		dlg = DirDialog(None, "Choose a folder to add", "", DD_DIR_MUST_EXIST | DD_DEFAULT_STYLE)
-		if dlg.ShowModal() == ID_OK:
-			path = dlg.GetPath()
-			model = self.folderView.GetModel()
-			item = FolderViewItem("folder", path, model.root)
-			model.addItem(item, model.root)
-		pass
-
-	def rescanFolders(self, event):
-		print("rescan")
-		pass
-
-	def showOptions(self, event):
-		dlg = OptionDialog(self, self.config)
-		if dlg.ShowModal() == ID_OK:
-			print(dlg.config)
-			self.config = dlg.config
-		pass
-
-	def findDupes(self, event):
-		pass
-
+class Application(QWidget):
 	def __init__(self):
-		super().__init__(None, title="DupeVideoCV")
-		self.createScreen()
+		super().__init__()
+
+		self.setMinimumSize(QSize(1000,480))
+		self.setWindowTitle("DupeVideoCV")
+		self.isFindingDupes = False
+
+		self.initView()
 
 		self.config = {
-			"filetypes" : ["mp4", "avi", "wmv", "3pg", "mpg", "ts", "mov"]
+			"filetypes" : ["mp4", "mpg", "wmv", "avi", "ts", "3pg", "mov"]
 		}
 
+	def createTreeView(self):
+		treeView = QTreeWidget(self)
+		treeView.setHeaderLabels(["Folder", "Status"])
+		treeView.setColumnCount(2)
 
-app = App()
-window = MainWindow()
-window.Show()
-app.MainLoop()
+		treeView.header().setSectionResizeMode(0, QHeaderView.Stretch)
+
+		return treeView
+		pass
+
+	def initView(self):
+		self.treeView = self.createTreeView()
+
+		addFolder = QPushButton("Add")
+		addFolder.clicked.connect(self.onAddFolder)
+
+		removeFolder = QPushButton("Remove")
+		removeFolder.clicked.connect(self.onRemoveFolder)
+
+		rescan = QPushButton("Rescan")
+		rescan.clicked.connect(self.onRescan)
+
+		options = QPushButton("Options")
+		options.clicked.connect(self.onOptions)
+
+		findDupes = QPushButton("Find Dupes")
+		findDupes.clicked.connect(self.onFindDupes)
+
+		mainLayout = QVBoxLayout()
+		mainLayout.addWidget(self.treeView)
+
+		buttonGroupLayout = QHBoxLayout()
+		leftButtons = QHBoxLayout()
+		leftButtons.addWidget(addFolder)
+		leftButtons.addWidget(removeFolder)
+		leftButtons.addWidget(rescan)
+		leftButtons.addWidget(options)
+
+		rightButtons = QHBoxLayout()
+		rightButtons.addWidget(findDupes, alignment=Qt.AlignRight)
+
+		buttonGroupLayout.addLayout(leftButtons)
+		buttonGroupLayout.addLayout(rightButtons)
+		mainLayout.addLayout(buttonGroupLayout)
+		self.setLayout(mainLayout)
+
+	def onAddFolder(self):
+		path = QFileDialog.getExistingDirectory(self, caption="Add a folder")
+		item = TreeItem(path, "")
+		self.treeView.addTopLevelItem(item)
+		self.scanFolderForVideo(path)
+
+	def onRemoveFolder(self):
+		items = self.treeView.selectedItems()
+		for item in items:
+			index = self.treeView.indexOfTopLevelItem(item)
+			if index > -1:
+				self.treeView.takeTopLevelItem(self.treeView.indexOfTopLevelItem(item))
+
+	def onRescan(self):
+		paths = [self.treeView.topLevelItem(i).path for i in range(self.treeView.topLevelItemCount())]
+		self.treeView.clear()
+		for path in paths:
+			self.scanFolderForVideo(path)
+		pass
+
+	def onOptions(self):
+		dlg = OptionsDialog(self.config)
+		if dlg.exec_():
+			self.config = dlg.config
+			print(self.config)
+		pass
+
+	def onFindDupes(self):
+		if not self.isFindingDupes:
+			self.isFindingDupes = True
+
+			with Pool(5) as pool:
+				for file in self._nextFile():
+					tracker = ProgressTracker()
+					tracker.registerUpdateCallback(self.onProgress)
+
+					future = pool.apply_async(ScanWorker.scan, (tracker,))
+					tracker.start()
+
+			self.isFindingDupes = False
+
+		pass
+
+	def onProgress(self, done, file, progress):
+		print(file, progress)
+		pass
+
+	def onScanComplete(self, file, results):
+		print(file, results)
+		pass
+
+
+	def _nextFile(self):
+		for i in range(self.treeView.topLevelItemCount()):
+			item = self.treeView.topLevelItem(i)
+			for c in range(item.childCount()):
+				child = item.child(c)
+				path = item.path + "/" + child.path
+				yield path
+
+	def findFolderItem(self, folder):
+		for i in range(self.treeView.topLevelItemCount()):
+			item = self.treeView.topLevelItem(i)
+			if item.path == folder:
+				return item
+		return None
+
+	def scanFolderForVideo(self, folder):
+		for (root, dirs, files) in os.walk(folder):
+			for file in files:
+				ext = os.path.splitext(file)[-1][1:]
+				if ext in self.config["filetypes"]:
+					item = self.findFolderItem(root)
+
+					# Add the folder to the top if we don't have it
+					if not item:
+						item = TreeItem(root, "")
+						self.treeView.addTopLevelItem(item)
+					newItem = TreeItem(file, "")
+					item.addChild(newItem)			
+
+
+if __name__ == "__main__":
+	app = QApplication(sys.argv)
+	font = QFont("times", 8)
+	app.setFont(font)
+	mainWnd = Application()
+	mainWnd.show()
+	sys.exit(app.exec_())
